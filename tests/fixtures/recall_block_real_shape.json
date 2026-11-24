@@ -1,0 +1,57 @@
+{
+  "answerability": "partial",
+  "coverage": "partial",
+  "gaps": ["auto_relevance_below_floor:lexical:36", "vector_unavailable"],
+  "items": [
+    {
+      "applicability": "trusted scope",
+      "basis": "observed",
+      "content": "（合成内容 A）用户偏好把重活交给 PC，云端只做常驻与调度。这一条被刻意写得很长，用来模拟真实 recall 里 2–20KB 的单条内容：HOST 端有 GPU，云端只有 2C2G，所以凡是编译、渲染、图形操作都应当在 PC 上执行，云端只保留网关、定时任务与状态库。",
+      "entries": [{"id": "default", "name": "cloud-bot"}],
+      "evidence_refs": ["event-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa@1"],
+      "expandable": false,
+      "kind": "event",
+      "occurred_at": "2026-11-20T10:34:36.671889+08:00",
+      "origin": "assistant_visible",
+      "ref": "event-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "revision": 1,
+      "source_contexts": [{"chat_type": "private", "platform": "desktop"}],
+      "temporal_status": "current"
+    },
+    {
+      "applicability": "trusted scope",
+      "basis": "direct_report",
+      "content": "（合成内容 B）用户要求技能可以自动创建，但每两周要看一份技能变更清单。所以技能文件的改动要留痕：新增、改名、删除都要能在清单里看出来，而不是只写在提交信息里。",
+      "entries": [{"id": "default", "name": "cloud-bot"}],
+      "evidence_refs": ["event-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb@1"],
+      "expandable": false,
+      "kind": "event",
+      "occurred_at": "2026-11-21T13:06:39.551303+08:00",
+      "origin": "human_direct",
+      "ref": "event-bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "revision": 1,
+      "source_contexts": [{"chat_type": "private", "platform": "desktop"}],
+      "temporal_status": "current"
+    },
+    {
+      "applicability": "trusted scope",
+      "basis": "observed",
+      "content": "（合成内容 C）任何会消耗订阅额度的操作，必须先估算 token 或次数并告知代价。这条在长会话里反复出现，是用户明确纠正过的一条规则。",
+      "entries": [{"id": "default", "name": "cloud-bot"}],
+      "evidence_refs": ["event-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc@1"],
+      "expandable": false,
+      "kind": "event",
+      "occurred_at": "2026-11-22T12:04:21.024423+08:00",
+      "origin": "assistant_visible",
+      "ref": "event-cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+      "revision": 1,
+      "source_contexts": [{"chat_type": "private", "platform": "desktop"}],
+      "temporal_status": "current"
+    }
+  ],
+  "memory_epoch": 1578,
+  "request_id": "hermes-prefetch:local-fixture",
+  "schema": "scope-recall.recall_context/1.1",
+  "status": "partial",
+  "unmet_needs": ["expandable"]
+}

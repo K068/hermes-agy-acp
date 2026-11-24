@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+*.log
+*.ndjson
+tests/last-run.log
+tests/probe-real.log
+evidence/
+.DS_Store
