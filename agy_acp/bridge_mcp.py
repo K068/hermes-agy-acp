@@ -96,6 +96,11 @@ def _skill_tool() -> dict[str, Any]:
     }
 
 
+#: agy moves larger tool sets to on-demand loading unless a tool opts out; a lazily loaded tool never
+#: reaches the model's function list, so the bridge would look like it has no tools at all.
+ALWAYS_LOAD = {"antigravity/alwaysLoad": True}
+
+
 def tool_schemas(extra_skills: tuple[str, ...] = ()) -> list[dict[str, Any]]:
     """At most ``MAX_TOOLS`` tools: the two polymorphic ones, plus one per configured skill."""
     tools = [_memory_tool(), _skill_tool()]
@@ -117,6 +122,8 @@ def tool_schemas(extra_skills: tuple[str, ...] = ()) -> list[dict[str, Any]]:
                 "page_size": {"type": "integer", "minimum": 1},
             }, "required": []},
         })
+    for tool in tools:
+        tool.setdefault("_meta", dict(ALWAYS_LOAD))
     return tools[:MAX_TOOLS]
 
 

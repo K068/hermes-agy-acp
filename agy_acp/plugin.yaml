@@ -1,6 +1,6 @@
 name: agy-acp
 kind: model-provider
-version: 0.7.2
+version: 0.8.0
 description: Native stateful Antigravity (agy acp) provider — pooled ACP sessions, no history replay
 author: Hermes (local)
 requires_hermes: ">=0.22.5"

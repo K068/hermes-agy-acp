@@ -136,6 +136,9 @@ class BridgeProtocolTests(unittest.TestCase):
             self.assertEqual(set(props["action"]["enum"]), {"search", "show", "revise", "forget"})
             self.assertIn("retract", props)
             self.assertIn("value", props)
+            for schema in client.tools():
+                self.assertEqual(schema.get("_meta", {}).get("antigravity/alwaysLoad"), True,
+                                 f"{schema['name']} must opt out of agy's lazy tool loading")
             self.assertIn("page", props)
             self.assertIn("page_size", props)
             # no file/terminal/search tool may be re-declared here

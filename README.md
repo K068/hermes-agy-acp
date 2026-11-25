@@ -1,375 +1,366 @@
-<div align="center">
+# agy_acp — native stateful Antigravity provider for Hermes
 
-# hermes-agy-acp
-
-**A native, stateful Antigravity provider for Hermes — one ACP session per chat, deltas only, no history replay.**
-
-[![tests](https://img.shields.io/badge/tests-115%20passing-brightgreen)](#testing)
-[![python](https://img.shields.io/badge/python-3.10%2B-blue)](#requirements)
-[![license](https://img.shields.io/badge/license-MIT-black)](LICENSE)
-[![agy](https://img.shields.io/badge/agy-1.5.15-purple)](#compatibility)
-
-[English](#english) · [中文](#中文)
-
-</div>
-
----
-
-## English
-
-### What this is
-
-A Hermes Agent **provider plugin**. It drives the official Antigravity CLI (`agy acp`) as a
-long-lived, bidirectional JSON-RPC child process, so the model keeps its own native conversation
-state. Hermes sends **only the newest user turn**; history, tool state and the prompt cache live
-inside `agy`.
-
-It replaces the older HTTP-gateway approach (an OpenAI-compatible shim in front of a per-request
-`agy` process that replayed the whole conversation on every call).
-
-### Why it exists
-
-| | HTTP gateway (before) | this provider |
-|---|---|---|
-| Conversation state | none — full replay per request | native, inside `agy` |
-| Prompt prefix reuse | none | **77 % cache hit** measured on a warm turn |
-| Tokens per follow-up | whole history | the delta (~2.5 k vs ~10.5 k measured) |
-| Tools | re-declared every call; schema bloat | `agy`'s own tools, unchanged |
-| Latency over a long chat | grows with history | flat |
-| Hermes-side history edits | silently forked the model's state | refused before sending (`NonlinearTurnError`) |
-
-### Architecture
+Route A: **one live `agy acp` child per chat**, driven directly over stdin/stdout JSON-RPC. Hermes
+sends the newest user turn only; history, tool state and the prefix cache stay inside the agent.
+The ACP-Ant HTTP gateway (`/opt/acp-ant/acp_ant.py`:8095 + `/opt/acp-ant-shim`:8098) is not used by
+this provider at all.
 
 ```
 Hermes agent loop
-  └── client.chat.completions.create(model, messages)        OpenAI-compatible seam
-       └── AgyAcpClient                 client.py   delta slicing, guards, usage mapping
-            ├── AgyAcpSessionManager    manager.py  child pool (idle 4 h / LRU 4), N turn slots
-            │    ├── AgyConnection      protocol.py NDJSON duplex, request table, stderr pump
-            │    │     └── agy acp                  one child per chat, own process group
-            │    ├── PermissionBroker   permissions.py  capability modes, Hermes approval gate
-            │    ├── SessionStore       store.py       hermes_session ⇄ acp_session (SQLite)
-            │    └── EventLog           display.py     folded activity, loop breaker
-            ├── memory / prompt         memory.py, prompt.py   recall tail, 160 KB spill
-            └── control plane           control_plane.py + bridge_mcp.py + mcp_mount.py
+   └── client.chat.completions.create(model, messages=[…])        # agent/acp_client.py contract
+        └── AgyAcpClient            client.py     turn slicing, guards, OpenAI facade
+             ├── AgyAcpSessionManager  manager.py  pool (idle+LRU), Semaphore(1) gate, turn execution
+             │    ├── AgyConnection    protocol.py NDJSON duplex, request table, stderr pump, frame trace
+             │    │     └── `agy acp`  (one child per chat, own process group / Job Object)
+             │    ├── PermissionBroker permissions.py  90 s ask→deny state machine
+             │    ├── SessionStore      store.py      hermes_session_id → acp_session_id (SQLite)
+             │    └── EventLog          display.py    folded tool activity, loop breaker
+             ├── memory/prompt          memory.py, prompt.py   scope-recall tail + dedupe, 160 K spill
+             └── control plane          control_plane.py + bridge_mcp.py + mcp_mount.py
 ```
 
-### Features
+## Settings: env or config.yaml
 
-**Session model**
-
-- **Delta-only turns.** `session/prompt` carries the newest user message; nothing else is re-sent.
-- **Crash-safe resume.** A restarted Hermes re-attaches with `session/load` (verified across `kill -9`).
-- **In-flight marker.** A turn cut off by a restart is reported once to the model, then cleared.
-- **Non-linear edits refused.** Re-send / regenerate / history edit raises before a single token is
-  spent; `AGY_ACP_ON_NONLINEAR=resync` opens a fresh native session instead.
-- **Pooling + teardown.** Idle/LRU eviction, POSIX process groups, Windows `taskkill /F /T` + Job Object.
-  The Windows path is tested on a real machine (child **and** grandchild die).
-
-**Safety**
-
-- **Capability modes** — `readonly` / `supervised` / `full`, decided once per session.
-- **Hermes' own approval gate.** ACP permission requests are routed through
-  `tools.approval.request_tool_approval`, so the prompt is the one you already answer, `always`
-  answers persist, and a headless context falls back to a file inbox instead of guessing.
-- **Human-in-the-loop by default.** Cron / subagents / aux calls are refused unless you name the
-  origins you trust (`AGY_ACP_ALLOW_BACKGROUND_ORIGINS`).
-- **Bounded everything.** Turn timeout, permission timeout, tool-loop breaker, `session/cancel`, and a
-  Stop button that works even while the session is still spinning up.
-
-**Control plane (Hermes overlay, opt-out)**
-
-`agy` keeps its own file, search and terminal tools. Hermes adds only what `agy` cannot see, through
-one small stdio MCP server plus a single Turn-1 block:
-
-| | |
-|---|---|
-| `hermes_memory` | `search` · `show` · `revise` · `forget` — paged, 4 KB per page |
-| `hermes_skill` | `list` · `view`, plus one tool per configured skill (≤ 5 tools total) |
-| `<hermes_control_plane>` | ≤ 500-token persona excerpt, injected on turn 1 only, so the cache stays intact |
-
-There is deliberately **no create verb**: new memories come from Hermes' turn-capture pipeline, so the
-model is told to state the fact rather than pretend to write it.
-
-### Requirements
-
-- Hermes Agent with the plugin provider contract (`requires_hermes >= 0.22.5`)
-- The official `agy` CLI, signed in (`agy` in `PATH`, or `AGY_ACP_BIN=/path/to/agy`)
-- Python 3.10+ for the plugin itself (stdlib only — no pip dependencies)
-
-### Install
+Every knob has an `AGY_ACP_*` environment variable and an optional `agy_acp:` section in the
+profile's `config.yaml`; **the environment wins** when both are set:
 
 ```bash
-git clone https://github.com/K068/hermes-agy-acp.git ~/hermes-agy-acp
-ln -s ~/hermes-agy-acp/agy_acp ~/.hermes/plugins/agy_acp     # Hermes loads the package directory
-hermes plugins validate ~/.hermes/plugins/agy_acp
-hermes model        # pick "Antigravity (agy acp)"
+hermes config set agy_acp.max_concurrent 3
+hermes config set agy_acp.capability_mode readonly
 ```
 
-Optional but recommended in `~/.hermes/config.yaml` (environment variables win when both are set):
+## Concurrency
 
-```yaml
-agy_acp:
-  command: /opt/acp-ant/bin/agy          # absolute path keeps delegation's resolver happy
-  child_home: /opt/acp-ant/accounts/g1   # the HOME that holds the agy sign-in
-  proxy: http://127.0.0.1:7890           # the agent needs its own egress if Google is blocked
-  max_concurrent: 4
-  capability_mode: supervised
+`AGY_ACP_MAX_CONCURRENT` (default 4) is how many turns may run at once against the single account.
+It is a real limit, not a queue: when every slot is busy the request waits up to its own timeout and
+then fails with a message naming the setting, so nothing is silently dropped. Raise it with care —
+parallel prompts are the fastest route to a 429 on one consumer subscription. With one slot the old
+behaviour returns: a permission dialog temporarily hands its slot back so it cannot starve another
+chat.
+
+### Delegated children
+
+`AGY_ACP_ALLOW_BACKGROUND_ORIGINS` names the automations allowed to drive the account even though
+`allow_background` is off: `subagent`, `cron`, `kanban`, `webhook`, `background`, `heartbeat`
+(comma list in the environment, a YAML list in `config.yaml`). Empty by default — spec §1.2 makes
+this provider human-only, and opening it to `delegate_task` is a deliberate, visible choice:
+
+```bash
+hermes config set agy_acp.allow_background_origins subagent
 ```
 
-### Configuration
+The child is launched with `HOME` = `agy_acp.child_home` and the proxy from `agy_acp.proxy`; both are
+read from `config.yaml` on every call, and a change to a launch setting (binary, args, account home,
+proxy, bridge name, concurrency, capability mode, origins) rebuilds the session manager instead of
+waiting for a restart. Delegation still resolves the binary through Hermes' external-process ladder,
+which reads `process_command` from the provider profile **at gateway start**. The profile resolves it to an
+absolute path (env `AGY_ACP_BIN`/`AGY_BIN` → `PATH` → `/opt/acp-ant/bin/agy`), so after changing where
+`agy` lives — or after this plugin's first install — restart the gateway once.
 
-Every key has an `AGY_ACP_*` environment variable and an `agy_acp:` entry in `config.yaml`
-(environment wins). The ones that matter day to day:
+## Capability modes (T3 Code's idea, scaled down)
 
-| Key | Default | What it does |
+| mode | agy's shell/file writes | bridge memory ops | use |
+|---|---|---|---|
+| `readonly` | allowed to read; **a write asks** (gate/inbox) | reads allowed; a write asks | "nothing changes unless I say so" |
+| `supervised` *(default)* | ask (Hermes' own gate) | allowed (as in Hermes) | normal use |
+| `full` | allowed | allowed | you trust the session completely |
+
+The mode is read once when the session's broker is built; nothing inside a turn can escalate it.
+`readonly` never refuses outright — it routes the write to the same human gate as everything else,
+so a refusal is a decision somebody made, not a wall.
+
+Usage numbers: agy reports `inputTokens` / `outputTokens` / `cachedReadTokens` / `thoughtTokens`;
+the provider maps them onto the OpenAI shape (`prompt_tokens_details.cached_tokens`), so cache hits
+are visible — measured 77 % on a warm second turn.
+
+## A turn that died with the provider
+
+Before every `session/prompt` the session is marked in `agy_acp_inflight`; the mark is cleared in the
+same `finally` that frees the turn slot. If the mark is still there next time (gateway restarted
+mid-turn), the model gets one line — *"your previous turn was interrupted … it was not saved"* —
+appended to that turn's delta, so it does not pretend the work happened. `AGY_ACP_ON_INTERRUPTED=ignore`
+turns the note off; `cli status` lists any live marks.
+
+## The control plane (Hermes overlay, opt-out with `AGY_ACP_INJECT_HERMES_LAYER=0`)
+
+agy keeps every local capability: file edits, code search, shell. Hermes therefore adds **nothing**
+in that space — it adds the two things agy cannot see:
+
+| Piece | What it is | Cost per turn |
 |---|---|---|
-| `command` / `AGY_ACP_BIN` | `agy` | the binary to run |
-| `child_home` / `AGY_ACP_HOME` | *(empty)* | `HOME` for the child — this is where the sign-in lives |
-| `proxy` / `AGY_ACP_PROXY` | *(empty)* | `HTTPS_PROXY` for the child |
-| `model` | *(account default)* | e.g. `gemini-4-neon-xhigh`, `gemini-4-hydrogen-high` |
-| `max_concurrent` | `4` | turn slots on the one account; `1` restores strict serialization |
-| `capability_mode` | `supervised` | `readonly` / `supervised` / `full` |
-| `allow_background_origins` | *(empty)* | which automations may drive the account (`subagent`, `cron`, …) |
-| `inject_hermes_layer` | `true` | `false` = pure `agy`, no MCP, no Turn-1 block |
-| `max_prompt_chars` | `160000` | above this the turn is spilled to a file and referenced by path |
-| `memory_tokens` | `2000` | recalled-memory budget per turn |
-| `bridge_approval` | `all` | `all` / `reads` / `none` — when the bridge may prompt |
-| `enable_ndjson_trace` | `false` | per-frame stdio trace under `.hermes_traces/` |
+| `hermes-bridge` MCP (stdio, mounted in `session/new`) | 2 polymorphic tools: `hermes_memory` (`search`/`show`/`revise`/`forget`, paged — no create verb) and `hermes_skill` (`list`/`view`, paged). Hard cap 4 KB per result with `has_more`/`next_page` | 0 tokens until called; ~2 tool schemas |
+| Turn-1 `<hermes_control_plane>` block | ≤500-token excerpt of the persona (tool-instruction lines stripped) + "when to use the bridge" | once, on the first turn only |
 
-### Usage
+Rules the implementation enforces:
 
-Once selected as the provider it behaves like any other model. Useful extras:
+- **Turn 1 only.** The block rides in the first `session/prompt` user text, after the memory tail and
+  after the spill, so it becomes part of the cached prefix. Turn 2+ sends the delta and nothing else
+  (`test_bridge.ControlPlaneInjectionTests`).
+- **No duplicate tools.** The bridge never exposes read/write/shell/search; `hermes_memory` and
+  `hermes_skill` are the whole surface, and the tool count is capped at 5 (`MAX_TOOLS`).
+- **No create verb, by design.** Neither scope-recall nor Hermes offers "add one memory": new
+  memories come from turn capture + consolidation. An earlier version exposed `action=save` writing
+  `bridge_notes.jsonl`; it was removed because that file is not a claim (no recall ranking, no
+  consolidation, no dedupe, invisible to other entries) and because the tool answer implied a write
+  that had not happened. The model is told to state the fact in its answer instead — the capture
+  pipeline records it. Legacy `bridge_notes.jsonl` files are still merged into `search`, never written.
+- **Shared stores work.** The bridge asks the store by `--root` first (`AGY_ACP_SR_ROOT`, a
+  `scope-recall/shared-root` pointer, or `~/.scope-recall/shared`), and falls back to
+  `--host hermes --instance-root $HERMES_HOME`, switching locators once if the store answers
+  `shared_store_entry`.
+- **Pure passthrough** (`AGY_ACP_INJECT_HERMES_LAYER=0`): `mcpServers: []`, no block, byte-for-byte
+  the same request as before the overlay existed.
 
-```bash
-python -m agy_acp.cli status          # sessions, slots, capability mode, in-flight turns
-python -m agy_acp.cli cancel <chat>   # stop a running turn
-python -m agy_acp.cli permissions     # pending approval requests (file channel)
-python -m agy_acp.cli answer <id> allow
-```
+## What was verified against the real CLI (2026-11-23, agy 1.5.15, Google AI Pro account)
 
-### Verified on a real machine
+A probe that sends **no** prompt (so it costs no quota) confirmed:
 
-Measured against `agy 1.5.15` with a Google AI Pro account, not simulated:
-
-| What | Number |
+| Fact | Evidence |
 |---|---|
-| Prefix cache on a warm second turn | **8 458 cached / 2 528 new** input tokens → 77 % |
-| Same follow-up without a cache (cold first turn) | 10 515 input tokens |
-| Native context survived the delta | the model answered a fact from turn 1 with no history sent |
-| Delegated child (`delegate_task` on this provider) | `HARDOK` in 22.4 s, `api_calls=1` |
-| Windows process-tree teardown | child + grandchild stopped, 3.19 s, `is_alive() == false` |
-| Crash recovery | `kill -9` on the child, a new process resumed the same `session/load` |
-| A real turn captured into scope-recall | 4 `source_events`, searchable, tagged with the entry |
+| `initialize` → `protocolVersion: 1`, `agentCapabilities.loadSession: true`, `sessionCapabilities: {load, close, resume, list}`, `_meta.antigravity.systemPrompt.append: true` | probe output, recorded in this repo's history |
+| `session/new {cwd, mcpServers}` → `{sessionId, models.availableModels, modes, configOptions[model, thought_level, mode], _meta.antigravity.tier}` | 23 model ids, e.g. `gemini-4-neon-high`, `claude-sonnet-5-5-high`, `gpt-oss-120b-medium` |
+| `session/load {sessionId, cwd, mcpServers}` restores a session **after the process was killed** | created a session in process A, `kill -9`, loaded it in process B → same `sessionId`, same configOptions |
+| unknown id → `-32002 "Session not found: …"` (i.e. the method exists) | probe |
+| Model selection is `session/set_config_option {configId: "model"|"thought_level", value}` | probe + `/opt/acp-ant/acp_ant.py` |
+| The child needs egress: `session/new` hangs forever on this host without `HTTPS_PROXY=http://127.0.0.1:7890` | measured: 120 s timeout direct, ~2 s through the proxy |
 
-### Compatibility
+`session/prompt` and `session/request_permission` were exercised against the bundled mock only —
+see "Testing" — because a real prompt spends subscription quota.
 
-Measured against `agy 1.5.15` (ACP over stdio):
+## Configuration
 
-- `initialize` advertises `loadSession`, `sessionCapabilities{load,close,resume,list}` and `configOptions{model,thought_level,mode}`.
-- `session/new` / `session/load` accept `mcpServers`, and the agent really spawns them on both paths.
-- The agent's MCP client probes `server/discover` **before** `initialize` and drops the whole server
-  if that errors — the bridge answers the probe for exactly this reason.
-- `usage` uses camelCase, including `cachedReadTokens` (the field a naive `cacheReadTokens` lookup misses).
-- Tool updates carry `title/status/input` only; tool **output** never crosses ACP.
+Everything is an environment variable (no core config keys). Set them where the gateway runs
+(`~/.hermes/.env` for this hub).
 
-### Testing
-
-```bash
-python -m unittest discover -s tests -t .      # 115 tests, ~30 s, no network, no quota
-```
-
-`mock_agy_acp.py` speaks the same JSON-RPC as the real CLI and covers ten scenarios, including
-`permission`, `permission_read`, `ratelimit`, `crash`, `loop`, `big_output`, `silent_new`,
-`stderr_flood` and `load_fail`. Nothing in the suite touches the real account.
-
-### Design notes
-
-- **No core edits.** The plugin lives entirely under `plugins/agy_acp/`.
-- **Reasons over retries.** When the agent's native session cannot be restored, the provider raises a
-  message naming the two ways forward rather than silently replaying history.
-- **Fail loudly at the boundary.** Protocol errors are classified (`rate_limit`, `auth`, `transport`),
-  so Hermes' fallback chain can act on them.
-- **Known limits.** One consumer account, so concurrency is a slot count, not a queue; the agent's own
-  prompt is ~8.7 k tokens before your text; a model switch inside a live session resets the cache.
-
----
-
-## 中文
-
-### 这是什么
-
-一个 Hermes Agent 的**模型 Provider 插件**。它把官方 Antigravity CLI（`agy acp`）作为长期存活的双向
-JSON-RPC 子进程来驱动，对话状态由模型自己持有。Hermes **只发最新一轮用户输入**，历史、工具状态和
-前缀缓存全部留在 `agy` 内部。
-
-它替代的是旧的 HTTP 网关方案（OpenAI 兼容 shim + 每次请求新开 `agy` 进程、把整段对话重放一遍）。
-
-### 为什么要做
-
-| | 旧 HTTP 网关 | 本 Provider |
+| Variable | Default | Meaning |
 |---|---|---|
-| 对话状态 | 没有，每次全量重放 | 原生保存在 `agy` 里 |
-| 前缀缓存复用 | 无 | 实测温轮**命中 77%** |
-| 后续轮次 token | 整段历史 | 仅增量（实测 ~2.5k vs ~10.5k） |
-| 工具 | 每次重复声明，schema 膨胀 | 完全用 `agy` 自带的 |
-| 长对话延迟 | 随历史增长 | 基本恒定 |
-| Hermes 侧改历史 | 静默让模型状态分叉 | 发送前直接拒绝（`NonlinearTurnError`） |
+| `AGY_ACP_BIN` | `agy` (else `AGY_BIN`) | binary; use the real executable, not a `.cmd` shim |
+| `AGY_ACP_ARGS` | `acp --disable-telemetry` | argv tail (shlex) |
+| `AGY_ACP_HOME` | *(inherited)* | `HOME` for the child — i.e. which `agy` login it uses |
+| `AGY_ACP_PROXY` | *(none)* | exported as `HTTPS_PROXY`/`HTTP_PROXY` (+ lowercase) for the child |
+| `AGY_ACP_MAX_SESSIONS` | `4` | LRU cap on live children |
+| `AGY_ACP_IDLE_SECONDS` | `14400` | idle timeout before a child is closed (mapping kept) |
+| `AGY_ACP_TURN_TIMEOUT` | `900` | per-turn wall clock |
+| `AGY_ACP_PERMISSION_TIMEOUT` | `90` | ask→deny deadline |
+| `AGY_ACP_AUTO_ALLOW_READONLY` | `1` | read/grep/ls/glob/search auto-allow |
+| `AGY_ACP_MAX_PROMPT_BYTES` | `114688` (112 KiB) | spill threshold in **bytes** — `agy` truncates the prompt by bytes at the tail, silently |
+| `AGY_ACP_MAX_PROMPT_CHARS` | `160000` | the older character budget; either limit spills the turn | above this the turn is spilled to a file |
+| `AGY_ACP_TOOL_LOOP_LIMIT` / `_SECONDS` / `_ACTION` | `15` / `180` / `cancel` | breaker |
+| `AGY_ACP_ENFORCE_LINEAR` / `AGY_ACP_ON_NONLINEAR` | `1` / `error` | regenerate / history-edit policy (`error` or `resync`) |
+| `AGY_ACP_ON_LOAD_FAILURE` | `error` | `error` (refuse) or `reset` (fresh session) |
+| `AGY_ACP_RETRY_429` / `_DELAY` | `1` / `5` | exactly one retry for a rate-limited turn |
+| `AGY_ACP_ALLOW_BACKGROUND` | `0` | override the interactive-only guard |
+| `AGY_ACP_ALLOW_AUX` | `0` | allow compression/titling/vision traffic (discouraged) |
+| `AGY_ACP_MODEL` | *(session default)* | default model when Hermes passes none |
+| `AGY_ACP_SYSTEM_PROMPT` | *(none)* | frozen prefix, sent once in `session/new` |
+| `AGY_ACP_STATE_DB` / `AGY_ACP_LOG_DIR` | `$HERMES_HOME/agy_acp/sessions.db` / `$HERMES_HOME/logs/agy_acp` | state and logs |
+| `AGY_ACP_MAX_CONCURRENT` | `4` | turn slots on the one account (1 = strict serialization) |
+| `AGY_ACP_CAPABILITY_MODE` | `supervised` | `readonly` (agy may look, not change) / `supervised` (its writes ask) / `full` (nothing asks) |
+| `AGY_ACP_APPROVAL_WAIT` | *(= permission_timeout)* | extra patience for a *write* prompt on the file channel, capped by `turn_timeout` |
+| `AGY_ACP_MEMORY_TOKENS` / `_ITEM_CHARS` | `2000` / `1200` | recalled-memory budget per turn, and the excerpt length per item |
+| `AGY_ACP_ON_INTERRUPTED` | `note` | tell the model its previous turn died with the provider (`ignore` to stay silent) |
+| `AGY_ACP_BRIDGE_NAME` | `hermes-bridge` | MCP server name; tool names become `mcp_<name>_*` |
+| `AGY_ACP_LEGACY_NOTES` | `0` | merge `bridge_notes.jsonl` (only from versions that had `action=save`) |
+| `AGY_ACP_DISPLAY_HEAD` / `_TAIL` | `2048` / `2048` | display-layer fold size |
+| `AGY_ACP_INJECT_HERMES_LAYER` | `1` | mount `hermes-bridge` + inject the turn-1 block; `0` = pure agy |
+| `AGY_ACP_BRIDGE_SKILLS` | *(none)* | comma-separated skill dirs to surface as extra tools (cap 5 total) |
+| `AGY_ACP_BRIDGE_PAGE_BYTES` | `4096` | hard cap per bridge result |
+| `AGY_ACP_CONTROL_PLANE_TOKENS` | `500` | budget for the turn-1 block |
+| `AGY_ACP_BRIDGE_CMD` / `_ARGS` | this python + `bridge_mcp.py` | bridge launch override |
+| `AGY_ACP_SR_CLI` / `AGY_ACP_SR_ROOT` | auto | scope-recall CLI path / shared-store root (resolved host-side and handed to the bridge) |
+| `AGY_ACP_BRIDGE_APPROVAL` | `all` | `all` = the bridge never prompts (matches Hermes, whose `revise`/`forget` tools are ungated); `reads` = memory writes ask; `none` = every bridge action asks. `AGY_ACP_AUTO_ALLOW_BRIDGE=0` still means `none` |
+| `AGY_ACP_APPROVAL_BACKEND` | `auto` | `auto` = Hermes' own approval gate when importable, else the file inbox; `hermes` = gate only; `file` = inbox only |
+| `AGY_ACP_BRIDGE_TRACE` | *(none)* | path of a raw MCP stdio trace (frames in and out) for handshake debugging |
+| `AGY_ACP_NDJSON_TRACE` | `0` | write per-frame traces (`in`/`out`, truncated) |
+| `AGY_ACP_TRACE_DIR` | `$HERMES_HOME/.hermes_traces` | where those traces land |
 
-### 架构
+Profile: `agy-acp` (aliases `agy`, `antigravity`, `antigravity-acp`), `auth_type=external_process`,
+`base_url=acp://agy`, `default_aux_model=""`, `supports_streaming=False`.
 
-```
-Hermes 主循环
-  └── client.chat.completions.create(model, messages)        与内置 provider 同一接缝
-       └── AgyAcpClient                 client.py   增量切片、守卫、用量映射
-            ├── AgyAcpSessionManager    manager.py  子进程池（空闲 4h / LRU 4）、N 个轮次槽位
-            │    ├── AgyConnection      protocol.py NDJSON 双向、请求表、stderr 泵
-            │    │     └── agy acp                  一 chat 一进程，独立进程组
-            │    ├── PermissionBroker   permissions.py  能力档、Hermes 原生审批闸门
-            │    ├── SessionStore       store.py      hermes 会话 ⇄ acp 会话（SQLite）
-            │    └── EventLog           display.py    折叠活动日志、工具循环熔断
-            ├── memory / prompt         memory.py, prompt.py   记忆尾注、160KB 落盘
-            └── 控制面                   control_plane.py + bridge_mcp.py + mcp_mount.py
-```
+## Acceptance criteria (spec §9) → tests
 
-### 功能
-
-**会话模型**
-
-- **只有增量**：`session/prompt` 只带最新用户消息，其余一概不重发。
-- **崩溃可恢复**：Hermes 重启后用 `session/load` 接回原生上下文（经 `kill -9` 实测）。
-- **在途标记**：被重启打断的那一轮，会向模型说明一次"上一轮被中断且未保存"，随后自动清除。
-- **拒绝非线性编辑**：重发 / 回退 / 改历史在发出前就报错，零请求；`AGY_ACP_ON_NONLINEAR=resync` 可改开新会话。
-- **池化与收尸**：空闲/LRU 淘汰；POSIX 用进程组，Windows 用 `taskkill /F /T` + Job Object，
-  **Windows 分支在真机上验证过**（子进程与孙进程都被清掉）。
-
-**安全**
-
-- **能力档**：`readonly` / `supervised` / `full`，每会话读一次，轮内不可提权。
-- **走 Hermes 自己的审批**：ACP 的权限请求转发给 `tools.approval.request_tool_approval`，
-  也就是你平时点的那张卡；选"总是允许"会被记住；无人在场时降级成文件收件箱，而不是瞎猜。
-- **默认只给人类用**：cron / 子 agent / 辅助调用一律拒绝，除非你显式点名信任的来源
-  （`AGY_ACP_ALLOW_BACKGROUND_ORIGINS`）。
-- **处处有界**：轮次超时、权限超时、工具循环熔断、`session/cancel`，以及"会话还在握手时按停止也有效"。
-
-**控制面（可一键关掉的 Hermes 叠加层）**
-
-`agy` 原本的文件、搜索、终端能力一律不动，Hermes 只补它看不见的东西：一个极小的 stdio MCP
-服务 + Turn-1 一次性注入。
-
-| | |
+| Spec item | Test |
 |---|---|
-| `hermes_memory` | `search` · `show` · `revise` · `forget`，分页，单页 4KB 上限 |
-| `hermes_skill` | `list` · `view`，外加每个配置技能一个工具（总数 ≤ 5） |
-| `<hermes_control_plane>` | ≤ 500 token 的人设摘要，仅第 1 轮注入，保住前缀缓存 |
+| 前缀缓存与增量：2–5 轮只发增量，记忆在用户消息里 | `test_turns.DeltaTests::test_only_the_newest_user_turn_crosses_the_pipe`, `::test_system_prompt_is_sent_once_at_session_new` |
+| 记忆去重：同一记忆只注入一次 | `test_memory_display.MemoryDedupeTests::test_same_memory_is_injected_once_per_native_session`, `::test_a_repeat_with_nothing_new_sends_no_block_at_all` |
+| Windows 进程树清理 | `test_protocol.ProcessTreeTests` (POSIX group assertion here; `taskkill /F /T` + Job Object path on Windows) |
+| 权限超时防死锁：90 s → deny → 释放锁 | `test_permissions.PermissionTimeoutTests::*` (0.7 s timeout in the test), `PermissionAnswerTests::test_waiting_for_a_permission_releases_the_account_gate` |
+| 即时中断：`session/cancel` 500 ms 内 | `test_turns.CancelTests::test_cancel_reaches_the_agent_in_milliseconds` |
+| 大文本与工具输出防护 | `test_memory_display.SpillTests`, `DisplayTests`, `ToolLoopTests` |
+| 并发串行化 (Semaphore(1)) | `test_turns.SerializationTests::test_turns_never_overlap_account_wide` |
+| 429 退避（≤1 次重试） | `test_turns.RateLimitTests` |
+| 进程崩溃降级 + `session/load` | `test_turns.CrashTests`, `test_pool.PoolTests::test_restart_loads_the_native_session_instead_of_replaying` |
+| Hermes 接线（profile/凭据/客户端） | `test_hermes_seam.HermesSeamTests` (runs in the real Hermes interpreter) |
 
-**故意没有"新建记忆"这个动词**：新记忆由 Hermes 的回合捕获管道产生，所以工具会直接告诉模型
-"把事实说出来就行"，而不是假装写入了什么。
-
-### 环境要求
-
-- Hermes Agent（`requires_hermes >= 0.22.5`，需要插件 provider 契约）
-- 已登录的官方 `agy` CLI（在 `PATH` 里，或用 `AGY_ACP_BIN=/path/to/agy` 指定）
-- Python 3.10+（插件只用标准库，无 pip 依赖）
-
-### 安装
+## Testing
 
 ```bash
-git clone https://github.com/K068/hermes-agy-acp.git ~/hermes-agy-acp
-ln -s ~/hermes-agy-acp/agy_acp ~/.hermes/plugins/agy_acp     # Hermes 加载的是这个包目录
-hermes plugins validate ~/.hermes/plugins/agy_acp
-hermes model        # 选 "Antigravity (agy acp)"
+cd ~/.hermes/plugins && python3 -m unittest discover -s agy_acp/tests -t .
 ```
 
-建议在 `~/.hermes/config.yaml` 里补上（环境变量优先级更高）：
+All of it runs against `mock_agy_acp.py` — a stdio server speaking the same dialect — so the loop
+is free and cannot 429. 57 tests, ~25 s. Scenarios: `default`, `permission`, `permission_read`,
+`ratelimit`, `crash`, `loop`, `big_output`, `silent_new`, `stderr_flood`, `load_fail`.
 
-```yaml
-agy_acp:
-  command: /opt/acp-ant/bin/agy          # 绝对路径，delegation 的解析器才找得到
-  child_home: /opt/acp-ant/accounts/g1   # 存放 agy 登录态的 HOME
-  proxy: http://127.0.0.1:7890           # Google 被墙时，给子进程单独出口
-  max_concurrent: 4
-  capability_mode: supervised
-```
+Two real-CLI facts this mock cannot prove — that the handshake succeeds on the real binary and that
+the account's model list matches `FALLBACK_MODELS` — are covered by `python3 -m agy_acp.probe`
+(step 1 above). One real `session/prompt` **has** been spent (2026-11-24, 22-character input,
+`end_turn`, 6.56 s, `inputTokens 8714 / outputTokens 21`) — see `evidence/real-turn.md`; a second
+turn, which is the only way to observe prefix-cache reuse, has not.
 
-### 配置
-
-每个键都有对应的 `AGY_ACP_*` 环境变量和 `agy_acp:` 配置项（同时出现时环境变量优先）。
-日常最常用的几个：
-
-| 键 | 默认 | 作用 |
-|---|---|---|
-| `command` / `AGY_ACP_BIN` | `agy` | 要启动的二进制 |
-| `child_home` / `AGY_ACP_HOME` | 空 | 子进程的 `HOME`，登录态就在这 |
-| `proxy` / `AGY_ACP_PROXY` | 空 | 子进程的 `HTTPS_PROXY` |
-| `model` | 账号默认 | 如 `gemini-4-neon-xhigh`、`gemini-4-hydrogen-high` |
-| `max_concurrent` | `4` | 单账号的并行轮次槽位；设 `1` 回到严格串行 |
-| `capability_mode` | `supervised` | `readonly` / `supervised` / `full` |
-| `allow_background_origins` | 空 | 允许哪些自动化驱动账号（`subagent`、`cron`…） |
-| `inject_hermes_layer` | `true` | 设 `false` = 纯净 agy，无 MCP、无 Turn-1 注入 |
-| `max_prompt_chars` | `160000` | 超过则落盘并以路径引用 |
-| `memory_tokens` | `2000` | 每轮记忆注入预算 |
-| `bridge_approval` | `all` | `all` / `reads` / `none`，桥什么时候要人批 |
-| `enable_ndjson_trace` | `false` | 帧级 stdio 追踪，写到 `.hermes_traces/` |
-
-### 使用
-
-选成 provider 之后与普通模型无异。常用辅助命令：
+## Switching to the real `agy acp` (3 steps)
 
 ```bash
-python -m agy_acp.cli status          # 会话、槽位、能力档、在途轮次
-python -m agy_acp.cli cancel <chat>   # 停掉正在跑的那一轮
-python -m agy_acp.cli permissions     # 文件通道里待批的请求
-python -m agy_acp.cli answer <id> allow
+cd ~/.hermes/plugins
+
+# 1) FREE probe — handshake, capabilities, model list, session/load support. Sends no prompt.
+AGY_ACP_BIN=/opt/acp-ant/bin/agy \
+AGY_ACP_HOME=/opt/acp-ant/accounts/g1 \
+AGY_ACP_PROXY=http://127.0.0.1:7890 \
+python3 -m agy_acp.probe        # expect "ok": true, 23 model ids, loadSession true, tier "Google AI Pro"
+
+# 2) env + route the chat at the stateful provider, then restart the gateway (it reads env at start)
+cat >> ~/.hermes/.env <<'EOF'
+AGY_ACP_BIN=/opt/acp-ant/bin/agy
+AGY_ACP_HOME=/opt/acp-ant/accounts/g1
+AGY_ACP_PROXY=http://127.0.0.1:7890
+AGY_ACP_MODEL=gemini-4-neon-high
+EOF
+hermes gateway restart
+hermes config set model.provider agy-acp
+hermes config set model.default gemini-4-neon-high
+
+# 3) ONE interactive turn in a chat, then verify it stayed stateful
+python3 -m agy_acp.cli status    # one row: turns 1, injected_memory 0; no second child after turn 2
+pgrep -af 'agy acp'              # exactly one process, and its cwd is the chat's workspace
 ```
 
-### 真机实测
+Without the proxy this host hangs in `session/new` (measured: 120 s, then timeout) because the
+Antigravity endpoint is unreachable directly — that is the single most likely first failure.
 
-以下数字来自 `agy 1.5.15` + Google AI Pro 账号，不是模拟：
+Rollback: `hermes config set model.provider opencode-go` (restore `model.default`), then
+`python3 -c "from agy_acp.client import get_manager; get_manager().close_all()"` to reap children.
 
-| 项目 | 数字 |
-|---|---|
-| 温轮前缀缓存 | **命中 8 458 / 新增 2 528** 输入 token → 77% |
-| 无缓存的冷首轮 | 10 515 输入 token |
-| 原生上下文确实保留 | 没发历史，模型答出了第 1 轮里的事实 |
-| 子 agent（`delegate_task` 走本 provider） | 22.4 秒回 `HARDOK`，`api_calls=1` |
-| Windows 进程树清理 | 子进程 + 孙进程都被停掉，3.19 秒，`is_alive() == false` |
-| 崩溃恢复 | 子进程 `kill -9` 后，新进程用 `session/load` 接回同一会话 |
-| 真实一轮被写进 scope-recall | 4 条 `source_events`，可检索，带 entry 归属 |
+Operator commands (`~/.hermes/plugins`, any of them work while the gateway runs):
+`status`, `sessions`, `permissions`, `answer <id> allow|deny`, `cancel <session>`.
 
-### 兼容性
-
-针对 `agy 1.5.15`（stdio 上的 ACP）实测：
-
-- `initialize` 声明 `loadSession`、`sessionCapabilities{load,close,resume,list}`、`configOptions{model,thought_level,mode}`；
-- `session/new` 与 `session/load` 都接受 `mcpServers`，且两条路径上 agy 都真的会拉起 MCP 子进程；
-- agy 的 MCP 客户端会在 `initialize` **之前**先探 `server/discover`，回错就丢弃整个 server——
-  桥之所以要实现这个探针，就是因为踩过；
-- `usage` 用 camelCase，缓存字段是 `cachedReadTokens`（按 `cacheReadTokens` 找会永远读到 0）；
-- 工具更新只带 `title/status/input`，工具**输出**从不跨界。
-
-### 测试
+## Quick check that `hermes-bridge` really mounted (real `agy`, no prompt, no quota)
 
 ```bash
-python -m unittest discover -s tests -t .      # 115 个用例，约 30 秒，不联网、不耗配额
+cd ~/.hermes/plugins
+# 1) the mount is in the request (free: session/new only) and agy spawns the bridge itself
+AGY_ACP_BIN=/opt/acp-ant/bin/agy AGY_ACP_HOME=/opt/acp-ant/accounts/g1 \
+AGY_ACP_PROXY=http://127.0.0.1:7890 HERMES_HOME=/tmp/agy-mount-check \
+python3 - <<'PY'
+import os, sys, subprocess, time
+sys.path.insert(0, os.getcwd())
+from agy_acp.manager import AgyAcpSessionManager
+from agy_acp.settings import Settings
+s = Settings.from_env(); s.ensure_dirs()
+m = AgyAcpSessionManager(s)
+p = m.session_for("mount-check", cwd="/tmp", model="gemini-4-neon-low")
+time.sleep(2)
+print(subprocess.run(["pgrep", "-af", "bridge_mcp.py"], capture_output=True, text=True).stdout or "NOT RUNNING")
+m.close_all()
+PY
+# expect: .../python3 .../agy_acp/bridge_mcp.py   ← agy started it
+grep -h "MCP servers of the session" /opt/acp-ant/accounts/g1/.gemini/antigravity-cli/log/acp-server-*.log | tail -1
+# expect: Preloading 1 MCP servers of the session
+
+# 2) the bridge answers on its own (no agy involved)
+HERMES_HOME=$HOME/.hermes python3 - <<'PY'
+import sys; sys.path.insert(0, "/root/.hermes/plugins")
+from agy_acp.tests.mcp_client import McpClient
+c = McpClient(env={"HERMES_HOME": "/root/.hermes"}); c.initialize()
+print(len(c.tools()), "tools:", [t["name"] for t in c.tools()])
+print(c.call("hermes_memory", {"action": "search", "query": "Tailscale", "page_size": 2})[0][:200])
+c.close()
+PY
 ```
 
-`mock_agy_acp.py` 用与真 CLI 相同的 JSON-RPC 说话，覆盖十个场景：`permission`、`permission_read`、
-`ratelimit`、`crash`、`loop`、`big_output`、`silent_new`、`stderr_flood`、`load_fail` 等。
-整个测试套件不碰真实账号。
+## Deviations from the spec — and why
 
-### 设计取舍
+1. **Synchronous transport, not `asyncio`.** Hermes' provider seam is `client.chat.completions.create(...)`
+   called from the agent loop's worker thread; the in-tree `agent/acp_client.py` is synchronous for
+   exactly that reason. The stateful transport therefore uses one reader thread + a request table,
+   with the same properties the spec asks of asyncio: event-driven reads, zero polling while idle,
+   millisecond cancel. A stray `asyncio` loop in a background thread would only add a hop.
+   The stop button is wired end to end: Hermes' interrupt loop calls `client.cancel()` on any
+   non-HTTP client (`agent/client_lifecycle.py::_abort_request_slot_client`), which for this provider
+   means "write `session/cancel` for the last turn" — no process teardown, no waiting.
+2. **No token streaming.** `supports_streaming=False`, like every ACP provider in-tree; the turn is
+   one blocking `session/prompt` and the answer arrives when the agent finishes its tool loop. `stream=True`
+   callers still get the two-chunk shape Hermes expects. Real streaming needs the response object to be
+   consumed incrementally by the core — an untested path for a stateful client, so it is not shipped.
+3. **Permission UI.** Hermes core has no plugin-facing permission modal, so the broker writes
+   `<session>.json` into `$HERMES_HOME/agy_acp/permissions/` (answerable by the CLI, a UI plugin, or
+   `PermissionBroker(handler=…)`) and answers **deny** at the deadline. Read-only tools auto-allow.
+4. **"Disable edit/regenerate" cannot remove UI buttons from a plugin.** It is enforced where it
+   matters: a re-sent turn (regenerate, or an edit that rewinds) is refused before anything is sent,
+   with a message that says what to do instead — or `AGY_ACP_ON_NONLINEAR=resync` forks a fresh native
+   session. Nothing is ever replayed silently.
+5. **`interactive_only` is a policy guard, not a capability boundary.** Cron (`HERMES_CRON_SESSION`),
+   delegating subagents and gateway background sources are refused; auxiliary traffic (compression,
+   titling, vision) is refused by inspecting the calling module, because the core does not pass an
+   `aux_task` flag to providers. Both have explicit escape hatches.
+6. **Tool activity in the chat.** The agent owns its tools, so Hermes never sees tool call/result
+   objects — it sees text. Activity goes to `logs/agy_acp/events-<session>.jsonl` (folded to
+   head+tail with `...[已省略 N 字节，完整输出保留在 agy 上下文中]...`) so nothing thousands of
+   tokens long reaches the chat DB or a UI. A future UI plugin can tail that file.
+7. **Windows tree cleanup is best-effort by design.** `taskkill /F /T` is the primary path; a Job
+   Object with `KILL_ON_JOB_CLOSE` is attached when `ctypes` allows it. Both are bounded, and the
+   POSIX path (process group SIGTERM → SIGKILL) is the one covered by tests here.
 
-- **零核心改动**：全部收在 `plugins/agy_acp/` 内。
-- **宁可报错也不重放**：原生会话恢复不了时，抛出说明两条出路的错误，而不是偷偷重发历史。
-- **边界处大声失败**：协议错误分类（`rate_limit` / `auth` / `transport`），好让 Hermes 的 fallback 链接手。
-- **已知限制**：单消费账号，所以并发是"槽位"而不是排队；模型的系统提示本身约 8.7k token；
-  会话中途换模型会让前缀缓存失效。
+## Known costs / limits
 
----
+- **How memory actually gets written.** Hermes' scope-recall plugin registers global turn hooks
+  (`turn_start` / `pre_llm_call` / `post_llm_call` / post-tool) and records each turn through
+  `sync_turn_source_events`; that path is independent of the model provider, so `agy_acp` neither
+  blocks nor replaces it. What the model can do *on its own* is `revise` (new value or `retract`) and
+  `forget` — scope-recall has **no create verb anywhere**, including its own tool surface
+  (`recall/inspect/profile/entity/revise/forget/status`): new memories come from the capture +
+  consolidation pipeline, not from a tool call — so the bridge exposes no create verb either:
+  `search`, `show`, `revise`, `forget`. Legacy `bridge_notes.jsonl` files are read, not written.
+- **Traces live under `$HERMES_HOME/.hermes_traces/`**, not inside the session workspace: a debugging
+  artefact should never appear in a user's repository.
+- **The bridge's own actions ride Hermes' rules: no prompt.** scope-recall's `revise`/`forget` tools are
+  not gated by Hermes (they call the store core directly), so gating the bridge's memory actions would
+  be stricter than the host. Ask for prompts only with `AGY_ACP_BRIDGE_APPROVAL=reads|none`.
+- **agy's shell and file writes still ask**, through Hermes' own gate rather than a bespoke dialog:
+  `tools.approval.request_tool_approval()` — the same gate as Tier-2 shell commands — so the prompt
+  appears where the user already answers approvals (CLI prompt, desktop/gateway approval card), an
+  `[a]lways` answer persists under `plugin_rule:agy:<tool>:<action>` and is not asked again
+  (session answers too), and a context with no human fails closed. Rule keys live in the profile's
+  `command_allowlist`; delete one there to make it ask again. `PermissionBroker` keeps its file inbox
+  as the fallback: if the gate is unavailable, raises, or answers `status: approval_required`
+  (no surface present), the request becomes a `perm-*.json` file answerable with
+  `python3 -m agy_acp.cli answer <id> allow|deny` — `approval_required` is deliberately **not**
+  treated as a denial.
+- **agy's MCP client probes before it connects.** It sends `server/discover`
+  (protocol `2026-07-28` in `_meta`) *before* `initialize`, and an error there drops the whole server
+  with `MCP server connection closed unexpectedly … invalid request`. `Preloading 1 MCP servers of the
+  session` in agy's log therefore does **not** prove the bridge mounted: check for the absence of
+  `invalid request` and, for real proof, watch a turn call `mcp_hermes-bridge_*`. `bridge_mcp.py`
+  answers the probe, the optional `resources`/`prompts`/`logging` surfaces, and never replies to
+  notifications.
+- **Byte budgets, not character budgets.** `agy` truncates an oversized `session/prompt` at ~128 KiB
+  of UTF-8, silently and at the tail — which is where the question is. One CJK character is three
+  bytes, so the spill threshold is measured in bytes (112 KiB default) and the inline head that
+  survives a spill is byte-capped too.
+- **Bridge tools opt out of lazy loading.** agy moves larger tool sets to on-demand unless a tool
+  declares `_meta: {"antigravity/alwaysLoad": true}`; a lazily loaded tool never appears in the
+  model's function list.
+- **Tool output never reaches the provider.** agy's `tool_call` updates carry `title/status/input` and
+  nothing else, so there is no 10–20 KB tool payload to fold on our side; the fold in `display.py`
+  exists for the fields we do render (and for a future agy that sends content).
+- **No third-party MCP passthrough.** `session/new` carries exactly one server (`hermes-bridge`) or
+  none; a whitelist for other servers is still an additive change.
 
-<div align="center">
-
-MIT © K068 · built for [Hermes Agent](https://hermes-agent.nousresearch.com/docs) · not affiliated with Google
-
-</div>
+- One turn at a time **per process**. A second chat's turn waits for the gate (and is released
+  during a permission wait); that is deliberate — parallel prompts are the fastest route to a 429.
+- A turn that `agy` answers with no text (denied permission, refusal) produces an explicit
+  `(agy returned no text; stop_reason=…)` line instead of an empty assistant message.
+- The model list is static (23 ids from the probe). Enumerating live would spawn an `agy` process on
+  every model-picker build; use `session/new` configOptions if you need the truth right now.
+- `plugins validate` reports two advisories: four guarded private imports (each with a fallback) and
+  "in-process only" isolation — the same trade-off every `create_client` provider makes.

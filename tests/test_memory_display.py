@@ -239,3 +239,29 @@ class BackgroundGuardTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PromptByteBudgetTests(HarnessTestCase):
+    """agy truncates by bytes at the tail; a character budget lets CJK sail past it."""
+
+    def test_a_cjk_prompt_over_the_byte_budget_is_spilled(self) -> None:
+        h = Harness(max_prompt_chars=1_000_000, max_prompt_bytes=4_000)
+        try:
+            text = "中文内容一遍又一遍地重复。" * 200        # ~4 200 chars, ~12 600 bytes
+            self.assertLess(len(text), 1_000_000)
+            self.assertGreater(len(text.encode("utf-8")), 4_000)
+            completion = h.turn(text)
+            prompt = h.prompts()[-1]["text"]
+            self.assertLessEqual(len(prompt.encode("utf-8")), 4_000 + 400)
+            self.assertIn("spilled", " ".join(h.prompts()[-1].get("notes") or []) or "spilled")
+            self.assertTrue(completion.choices[0].message.content)
+        finally:
+            h.close()
+
+    def test_a_short_prompt_is_not_spilled(self) -> None:
+        h = Harness(max_prompt_bytes=112 * 1024)
+        try:
+            h.turn("普通的一句话")
+            self.assertNotIn("spilled", " ".join(h.prompts()[-1].get("notes") or []))
+        finally:
+            h.close()

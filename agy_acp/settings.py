@@ -222,6 +222,9 @@ class Settings:
     model: str = ""
     system_prompt: str = ""
     max_prompt_chars: int = 160_000
+    #: `agy` truncates the prompt text by BYTES (~128 KiB, silently, at the tail). One CJK
+    #: character is three bytes, so a character budget is not a safe proxy — spill above this.
+    max_prompt_bytes: int = 112 * 1024
     permission_timeout: float = 90.0
     #: Extra patience for a *write* prompt on the file channel (default: same as permission_timeout).
     #: Always bounded by ``turn_timeout``: a turn cannot outlive its own budget.
@@ -350,6 +353,8 @@ class Settings:
             model=_as_str(pick("AGY_ACP_MODEL", "model", "")),
             system_prompt=_as_str(pick("AGY_ACP_SYSTEM_PROMPT", "system_prompt", "")),
             max_prompt_chars=_as_int(pick("AGY_ACP_MAX_PROMPT_CHARS", "max_prompt_chars", 160_000), 160_000),
+            max_prompt_bytes=_as_int(pick("AGY_ACP_MAX_PROMPT_BYTES", "max_prompt_bytes", 112 * 1024),
+                                     112 * 1024),
             permission_timeout=_as_float(pick("AGY_ACP_PERMISSION_TIMEOUT", "permission_timeout", 90.0), 90.0),
             approval_wait=(_as_float(raw_wait, 0.0) or None) if (raw_wait := _as_str(
                 pick("AGY_ACP_APPROVAL_WAIT", "approval_wait", ""))) else None,

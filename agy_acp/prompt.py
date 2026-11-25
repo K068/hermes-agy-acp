@@ -101,7 +101,7 @@ def user_hash(text: str) -> str:
 
 
 def spill_text(text: str, *, cwd: str, session_id: str, turn_number: int, fallback_dir: Path,
-               limit: int) -> tuple[str, str]:
+               limit: int, head_bytes: int = 0) -> tuple[str, str]:
     """Write an oversized turn next to the workspace (so the agent's own read_file can open it).
 
     Returns ``(replacement_text, path)``. On any IO error the text is returned unchanged — a
@@ -119,6 +119,9 @@ def spill_text(text: str, *, cwd: str, session_id: str, turn_number: int, fallba
             continue
         note = SPILL_NOTE.format(chars=len(text), path=str(path))
         head = text[:SPILL_HEAD_CHARS]
+        if head_bytes:  # the head is what stays inline, and agy counts bytes, not characters
+            while head and len(head.encode("utf-8")) > head_bytes:
+                head = head[: int(len(head) * 0.8)]
         return f"{note}\n--- begin ---\n{head}\n--- end ---", str(path)
     return text, ""
 
@@ -148,11 +151,17 @@ def build_turn(
     if dropped:
         notes.append(f"{dropped} image part(s) skipped (only inline data: images are forwarded)")
     spilled = ""
-    if len(adapted) > max_chars:
-        adapted, spilled = spill_text(adapted, cwd=cwd, session_id=session_id, turn_number=turn_number,
-                                      fallback_dir=work_dir, limit=max_chars)
+    max_bytes = int(getattr(settings, "max_prompt_bytes", 0) or 0) if settings is not None else 0
+    over_bytes = bool(max_bytes) and len(adapted.encode("utf-8")) > max_bytes
+    if len(adapted) > max_chars or over_bytes:
+        adapted, spilled = spill_text(
+            adapted, cwd=cwd, session_id=session_id, turn_number=turn_number,
+            fallback_dir=work_dir, limit=max_chars,
+            head_bytes=max(512, int(max_bytes * 0.4)) if max_bytes else 0)
         if spilled:
-            notes.append(f"turn spilled to {spilled} ({len(raw)} chars)")
+            notes.append(f"turn spilled to {spilled} ({len(raw)} chars / "
+                         f"{len(raw.encode('utf-8'))} bytes, budget {max_chars} chars"
+                         + (f" / {max_bytes} bytes" if max_bytes else "") + ")")
     layered = False
     if settings is not None and getattr(settings, "inject_hermes_layer", True):
         # Turn 1 only, and *after* the spill: the inline head must stay the user's own words, so the

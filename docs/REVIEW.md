@@ -53,7 +53,9 @@ docs/
 | 27 | Cache usage is parsed from agy's real field names (`cachedReadTokens`) | `client._usage` | `test_units.UsageParsingTests`; real frames: 8 458 cached / 2 528 input on a warm turn |
 | 28 | A real `agy_acp` turn is written into scope-recall | Hermes' capture hooks (unchanged) | real run: 4 `source_events`, searchable by token, tagged with the entry |
 | 29 | A delegated child reaches the account only through the origin allowlist, and the profile names an absolute `agy` | `client._create_chat_completion` guard, `settings.allow_background_origins`, `__init__._resolve_binary` | `test_hermes_seam.BackgroundGuardTests` (refused by default, allowed with the origin); `resolve_runtime_provider('agy-acp')` in a fresh process returns `command=/opt/acp-ant/bin/agy` |
-| 30 | The control plane is turn-1 only and stays ≤500 tokens | `control_plane.py`, `prompt.build_turn` | `ControlPlaneInjectionTests` (turn 2 must be the bare delta), `test_the_block_stays_within_the_token_budget` |
+| 30 | The spill threshold is a byte budget, and the inline head is byte-capped | `prompt.build_turn`, `prompt.spill_text` | `test_memory_display.PromptByteBudgetTests` (12 600-byte CJK turn spills; inline stays under the budget) |
+| 31 | Bridge tools declare `alwaysLoad` so agy does not hide them | `bridge_mcp.tool_schemas` | `test_bridge` asserts `_meta["antigravity/alwaysLoad"]` on every tool |
+| 32 | The control plane is turn-1 only and stays ≤500 tokens | `control_plane.py`, `prompt.build_turn` | `ControlPlaneInjectionTests` (turn 2 must be the bare delta), `test_the_block_stays_within_the_token_budget` |
 | 16 | Zero core edits | — | `git -C /root/.hermes/hermes-agent status --porcelain` is empty in the workspace this was built in; the package touches nothing outside its own directory |
 
 ## 2. Run it
