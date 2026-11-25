@@ -6,9 +6,9 @@ or never answering (the turn hangs until the transport timeout, holding the acco
 slot the whole time). This module implements the third option:
 
 * read-only tools are auto-allowed (opt out with ``AGY_ACP_AUTO_ALLOW_READONLY=0``);
-* anything that writes or executes becomes a **request file** under
-  ``$HERMES_HOME/agy_acp/permissions/`` — answerable by a UI plugin, by the bundled CLI
-  (``python -m agy_acp.permissions answer <id> allow``), or by an in-process callback;
+* supervised shell commands use Hermes' terminal guard when available;
+* other escalations use the Hermes tool gate or a **request file** under
+  ``$HERMES_HOME/agy_acp/permissions/``, answerable by the bundled CLI or an in-process callback;
 * the global turn lock is released while the user is being asked, so one stuck dialog cannot starve
   the other chats;
 * after ``AGY_ACP_PERMISSION_TIMEOUT`` (90 s default) the provider answers **deny** with
@@ -17,6 +17,7 @@ slot the whole time). This module implements the third option:
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
@@ -100,29 +101,20 @@ def bridge_read(tool: dict[str, Any], prefix: str = BRIDGE_PREFIX) -> bool | Non
     prefixes = tuple({(prefix or BRIDGE_PREFIX).lower(), *LEGACY_BRIDGE_PREFIXES})
     if not any(name.startswith(p) for p in prefixes):
         return None
-    raw = tool.get("rawInput")
-    if raw is None:
-        raw = tool.get("input")
-    if isinstance(raw, str):
-        try:
-            raw = json.loads(raw)
-        except ValueError:
-            raw = {}
-    action = str((raw or {}).get("action") or "").strip().lower()
-    return action in BRIDGE_READ_ACTIONS
+    return str(_tool_input(tool).get("action") or "").strip().lower() in BRIDGE_READ_ACTIONS
 
 
 def is_readonly(tool: dict[str, Any]) -> bool:
     kind = str(tool.get("kind") or "").lower()
     name = str(tool.get("name") or tool.get("toolName") or "").lower()
+    if name == "run_command":
+        return False
     if kind and kind in READONLY_KINDS:
         return True
     return bool(name) and name in READONLY_TOOLS
 
 
-def describe_for_human(tool: dict[str, Any], prefix: str = BRIDGE_PREFIX) -> tuple[str, str]:
-    """(one sentence for the approval card, rule key for a session/always answer)."""
-    name = str(tool.get("name") or tool.get("toolName") or "tool")
+def _tool_input(tool: dict[str, Any]) -> dict[str, Any]:
     raw = tool.get("rawInput")
     if raw is None:
         raw = tool.get("input")
@@ -131,7 +123,35 @@ def describe_for_human(tool: dict[str, Any], prefix: str = BRIDGE_PREFIX) -> tup
             raw = json.loads(raw)
         except ValueError:
             raw = {}
-    action = str((raw or {}).get("action") or "").strip().lower()
+    return raw if isinstance(raw, dict) else {}
+
+
+def check_native_command(command: str) -> dict[str, Any] | None:
+    """Use the host terminal guard without executing or rewriting the ACP command."""
+    try:
+        from tools.approval import (_presence, _unattended_contexts, check_all_command_guards,
+                                    detect_dangerous_command, is_approval_bypass_active)
+    except ImportError:
+        return None
+
+    verdict = check_all_command_guards(command, env_type="local")
+    if (verdict.get("approved") is True and not verdict.get("pre_approved")
+            and not is_approval_bypass_active()):
+        # The terminal guard allows unbound headless callers by default. Keep ACP's
+        # fail-closed behavior for flagged commands when there is no turn or policy.
+        _, cli, gateway, ask = _presence()
+        if not (cli or gateway or ask or _unattended_contexts()):
+            flagged, _, description = detect_dangerous_command(command)
+            if flagged:
+                return {"approved": False, "description": f"No Hermes approval surface: {description}"}
+    return verdict
+
+
+def describe_for_human(tool: dict[str, Any], prefix: str = BRIDGE_PREFIX) -> tuple[str, str]:
+    """(one sentence for the approval card, rule key for a session/always answer)."""
+    name = str(tool.get("name") or tool.get("toolName") or "tool")
+    raw = _tool_input(tool)
+    action = str(raw.get("action") or "").strip().lower()
     kind = str(tool.get("kind") or "").strip().lower()
     matched = next((p for p in ((prefix or BRIDGE_PREFIX).lower(), *LEGACY_BRIDGE_PREFIXES)
                     if name.lower().startswith(p)), "")
@@ -139,9 +159,13 @@ def describe_for_human(tool: dict[str, Any], prefix: str = BRIDGE_PREFIX) -> tup
         short = name[len(matched):]
         what = f"Hermes bridge: {short}" + (f" action={action}" if action else "")
         return f"agy wants to change Hermes memory ({what}). Allow it?", f"agy:{short}:{action or kind}"
-    target = str((raw or {}).get("CommandLine") or (raw or {}).get("Path") or "").strip()
+    target = str(raw.get("CommandLine") or raw.get("Path") or "").strip()
     what = f"{name}" + (f" {target[:120]}" if target else "")
-    return f"agy wants to run {what}. Allow it?", f"agy:{name}:{kind}"
+    rule_key = f"agy:{name}:{kind}"
+    if name.lower() == "run_command":
+        payload = json.dumps(raw, sort_keys=True, ensure_ascii=True)
+        rule_key += ":" + hashlib.sha256(payload.encode("ascii")).hexdigest()
+    return f"agy wants to run {what}. Allow it?", rule_key
 
 
 class PermissionBroker:
@@ -162,6 +186,7 @@ class PermissionBroker:
         on_wait_end: Callable[[], None] | None = None,
         handler: Callable[[dict[str, Any]], Decision | None] | None = None,
         native_gate: Callable[[str, str, str], dict[str, Any]] | None = None,
+        command_guard: Callable[[str], dict[str, Any] | None] | None = None,
         poll_interval: float = 0.2,
         log: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
@@ -183,6 +208,7 @@ class PermissionBroker:
         #: Hermes' own approval gate (tools.approval.request_tool_approval) when reachable: it shows
         #: the desktop/CLI prompt, keeps session and permanent answers, and fails closed with no human.
         self.native_gate = native_gate
+        self.command_guard = command_guard
         self.poll_interval = poll_interval
         self.log = log or (lambda event: None)
         self._pending: dict[str, PendingPermission] = {}
@@ -230,8 +256,31 @@ class PermissionBroker:
             decision = Decision(True, self._pick(options, ALLOW_KINDS), "read-only tool auto-allowed", "policy")
             self._note("permission.auto_allow", session_id, name, kind, decision)
             return self._respond(message, decision, options)
+        if (self.capability_mode == "supervised" and self.command_guard is not None
+                and name == "run_command" and kind == "execute"):
+            command = _tool_input(tool).get("CommandLine")
+            if isinstance(command, str) and command.strip():
+                try:
+                    verdict = self.command_guard(command)
+                except Exception:  # Guard failure is a denial, so it cannot be overridden by the inbox.
+                    verdict = {"approved": False, "description": "Hermes command guard failed"}
+                if verdict is not None:
+                    allowed = verdict.get("approved") is True
+                    # Hermes owns remembered approvals. Answer only for this ACP tool call.
+                    current_options = [option for option in options
+                                       if str(option.get("kind") or "").lower() not in
+                                       ("allow_always", "reject_always")]
+                    option_id = self._pick(current_options, ALLOW_KINDS if allowed else REJECT_KINDS)
+                    reason = str(verdict.get("user_summary") or verdict.get("description") or "")[:300]
+                    decision = Decision(allowed, option_id, reason, "hermes-command")
+                    self._note("permission.decision", session_id, name, kind, decision,
+                               extra={"outcome": verdict.get("outcome") or verdict.get("status"),
+                                      "pattern_key": verdict.get("pattern_key"),
+                                      "user_approved": verdict.get("user_approved", False),
+                                      "smart_approved": verdict.get("smart_approved", False)})
+                    return self._respond(message, decision, current_options)
         if self.native_gate is not None:
-            reason, rule_key = describe_for_human(tool)
+            reason, rule_key = describe_for_human(tool, self.bridge_prefix)
             self._note("permission.gate_request", session_id, name, kind, None,
                        extra={"rule_key": rule_key, "prompt": reason})
             verdict: dict[str, Any] | None

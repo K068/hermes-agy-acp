@@ -62,7 +62,7 @@ absolute path (env `AGY_ACP_BIN`/`AGY_BIN` → `PATH` → `/opt/acp-ant/bin/agy`
 | mode | agy's shell/file writes | bridge memory ops | use |
 |---|---|---|---|
 | `readonly` | allowed to read; **a write asks** (gate/inbox) | reads allowed; a write asks | "nothing changes unless I say so" |
-| `supervised` *(default)* | ask (Hermes' own gate) | allowed (as in Hermes) | normal use |
+| `supervised` *(default)* | shell uses the Hermes terminal guard, file writes ask | allowed (as in Hermes) | normal use |
 | `full` | allowed | allowed | you trust the session completely |
 
 The mode is read once when the session's broker is built; nothing inside a turn can escalate it.
@@ -145,7 +145,7 @@ Everything is an environment variable (no core config keys). Set them where the 
 | `AGY_ACP_AUTO_ALLOW_READONLY` | `1` | read/grep/ls/glob/search auto-allow |
 | `AGY_ACP_MAX_PROMPT_BYTES` | `114688` (112 KiB) | spill threshold in **bytes** — `agy` truncates the prompt by bytes at the tail, silently |
 | `AGY_ACP_MAX_PROMPT_CHARS` | `160000` | the older character budget; either limit spills the turn | above this the turn is spilled to a file |
-| `AGY_ACP_TOOL_LOOP_LIMIT` / `_SECONDS` / `_ACTION` | `15` / `180` / `cancel` | breaker |
+| `AGY_ACP_TOOL_LOOP_LIMIT` / `_SECONDS` / `_ACTION` | `15` / `180` / `cancel` | tool-start count and elapsed time outside ACP permission requests. The full prompt timeout still includes approval waits |
 | `AGY_ACP_ENFORCE_LINEAR` / `AGY_ACP_ON_NONLINEAR` | `1` / `error` | regenerate / history-edit policy (`error` or `resync`) |
 | `AGY_ACP_ON_LOAD_FAILURE` | `error` | `error` (refuse) or `reset` (fresh session) |
 | `AGY_ACP_RETRY_429` / `_DELAY` | `1` / `5` | exactly one retry for a rate-limited turn |
@@ -155,7 +155,7 @@ Everything is an environment variable (no core config keys). Set them where the 
 | `AGY_ACP_SYSTEM_PROMPT` | *(none)* | frozen prefix, sent once in `session/new` |
 | `AGY_ACP_STATE_DB` / `AGY_ACP_LOG_DIR` | `$HERMES_HOME/agy_acp/sessions.db` / `$HERMES_HOME/logs/agy_acp` | state and logs |
 | `AGY_ACP_MAX_CONCURRENT` | `4` | turn slots on the one account (1 = strict serialization) |
-| `AGY_ACP_CAPABILITY_MODE` | `supervised` | `readonly` (agy may look, not change) / `supervised` (its writes ask) / `full` (nothing asks) |
+| `AGY_ACP_CAPABILITY_MODE` | `supervised` | `readonly` (ask before execution or writes) / `supervised` (native shell guard, file writes ask) / `full` (nothing asks) |
 | `AGY_ACP_APPROVAL_WAIT` | *(= permission_timeout)* | extra patience for a *write* prompt on the file channel, capped by `turn_timeout` |
 | `AGY_ACP_MEMORY_TOKENS` / `_ITEM_CHARS` | `2000` / `1200` | recalled-memory budget per turn, and the excerpt length per item |
 | `AGY_ACP_ON_INTERRUPTED` | `note` | tell the model its previous turn died with the provider (`ignore` to stay silent) |
@@ -326,16 +326,14 @@ PY
 - **The bridge's own actions ride Hermes' rules: no prompt.** scope-recall's `revise`/`forget` tools are
   not gated by Hermes (they call the store core directly), so gating the bridge's memory actions would
   be stricter than the host. Ask for prompts only with `AGY_ACP_BRIDGE_APPROVAL=reads|none`.
-- **agy's shell and file writes still ask**, through Hermes' own gate rather than a bespoke dialog:
-  `tools.approval.request_tool_approval()` — the same gate as Tier-2 shell commands — so the prompt
-  appears where the user already answers approvals (CLI prompt, desktop/gateway approval card), an
-  `[a]lways` answer persists under `plugin_rule:agy:<tool>:<action>` and is not asked again
-  (session answers too), and a context with no human fails closed. Rule keys live in the profile's
-  `command_allowlist`; delete one there to make it ask again. `PermissionBroker` keeps its file inbox
-  as the fallback: if the gate is unavailable, raises, or answers `status: approval_required`
-  (no surface present), the request becomes a `perm-*.json` file answerable with
-  `python3 -m agy_acp.cli answer <id> allow|deny` — `approval_required` is deliberately **not**
-  treated as a denial.
+- In supervised mode, ACP `run_command` requests containing `CommandLine` use
+  `tools.approval.check_all_command_guards()` with the active Hermes turn context. Ordinary
+  commands proceed without a card. Flagged commands follow Hermes' approval mode and remembered
+  grants, and the native guard's denial ends that request. `agy` still runs the command itself.
+- Other escalations, including file writes, use `tools.approval.request_tool_approval()`. Its
+  remembered answers use `plugin_rule:agy:…` keys. A command sent through this fallback uses a
+  key specific to its arguments. When the tool gate is unavailable or returns `approval_required`,
+  the file inbox can be answered with `python3 -m agy_acp.cli answer <id> allow|deny`.
 - **agy's MCP client probes before it connects.** It sends `server/discover`
   (protocol `2026-07-28` in `_meta`) *before* `initialize`, and an error there drops the whole server
   with `MCP server connection closed unexpectedly … invalid request`. `Preloading 1 MCP servers of the

@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from agy_acp.permissions import PermissionBroker, bridge_read, answer_from_cli, describe_for_human
 
@@ -138,7 +140,10 @@ class GateRoutingTests(unittest.TestCase):
         reason, key = describe_for_human({"name": "run_command", "kind": "execute",
                                           "rawInput": {"CommandLine": "printf hi > e.txt"}})
         self.assertIn("printf hi", reason)
-        self.assertEqual(key, "agy:run_command:execute")
+        self.assertTrue(key.startswith("agy:run_command:execute:"))
+        _, other_key = describe_for_human({"name": "run_command", "kind": "execute",
+                                           "rawInput": {"CommandLine": "printf bye > e.txt"}})
+        self.assertNotEqual(key, other_key)
 
 
 class CapabilityModeTests(unittest.TestCase):
@@ -199,6 +204,119 @@ class CapabilityModeTests(unittest.TestCase):
         broker, _folder = self._broker("supervised", gate=lambda *a: called.append(a) or {"approved": True})
         broker.handle(self._msg("run_command", {"CommandLine": "rm -rf build"}, kind="execute"), session_id="s")
         self.assertEqual(len(called), 1)
+
+
+class NativeCommandApprovalTests(HarnessTestCase):
+    scenario = "permission_native"
+    settings = {"permission_timeout": 0.3, "inject_hermes_layer": False}
+
+    def setUp(self) -> None:
+        try:
+            from gateway.session_context import set_session_vars
+            from tools import approval
+        except ImportError as exc:
+            self.skipTest(f"requires the Hermes host: {exc}")
+        super().setUp()
+        self.addCleanup(self.h.close)
+        self.approval = approval
+        self.set_session_vars = set_session_vars
+        overrides = patch.dict(os.environ, {"AGY_ACP_APPROVAL_BACKEND": "hermes",
+                                            "HERMES_EXEC_ASK": ""})
+        overrides.start()
+        self.addCleanup(overrides.stop)
+        config = patch.object(approval.approval_context, "_get_approval_config", return_value={"mode": "manual"})
+        config.start()
+        self.addCleanup(config.stop)
+
+    def tearDown(self) -> None:
+        pass
+
+    def _turn(self, command: str, *, platform: str = "desktop", key: str = "agy-approval-test") -> str:
+        from contextvars import Context
+
+        def run():
+            self.set_session_vars(platform=platform, session_key=key, session_id=self.h.session)
+            self.h.turn(command)
+
+        Context().run(run)
+        outcomes = [r for r in self.h.records() if r.get("event") == "permission.outcome"]
+        return outcomes[-1]["outcome"]["result"]["outcome"]["optionId"]
+
+    def _listen(self, key: str, answer: str) -> list[dict]:
+        cards = []
+
+        def notify(card):
+            cards.append(card)
+            self.approval.resolve_gateway_approval(key, answer, request_id=card["request_id"])
+
+        self.approval.register_gateway_notify(key, notify)
+        self.addCleanup(self.approval.clear_session, key)
+        self.addCleanup(self.approval.unregister_gateway_notify, key)
+        return cards
+
+    def test_routine_command_skips_the_approval_card(self) -> None:
+        cards = self._listen("agy-approval-test", "deny")
+        self.assertEqual(self._turn("git status --short"), "allow-once")
+        self.assertEqual(cards, [])
+        self.assertNotIn("permission.ask", [r["event"] for r in self.h.event_dicts()])
+
+    def test_flagged_command_uses_the_current_turns_native_card(self) -> None:
+        first_cards = self._listen("previous-turn", "once")
+        self._turn("git status --short", key="previous-turn")
+        cards = self._listen("agy-approval-test", "deny")
+        self.assertEqual(self._turn("git reset --hard HEAD"), "reject-once")
+        self.assertEqual(first_cards, [])
+        self.assertEqual([card["command"] for card in cards], ["git reset --hard HEAD"])
+        self.assertNotIn("permission.ask", [r["event"] for r in self.h.event_dicts()])
+
+    def test_native_operator_deny_rules_take_precedence(self) -> None:
+        cards = self._listen("agy-approval-test", "once")
+        with patch.object(self.approval, "_match_user_deny_rule", return_value="git status*"):
+            self.assertEqual(self._turn("git status --short"), "reject-once")
+        self.assertEqual(cards, [])
+        self.assertNotIn("permission.ask", [r["event"] for r in self.h.event_dicts()])
+
+    def test_session_grant_stays_with_the_hermes_session(self) -> None:
+        first_key = "agy-approval-session-grant"
+        first_cards = self._listen(first_key, "session")
+        self.assertEqual(self._turn("git reset --hard HEAD", key=first_key), "allow-once")
+        self.assertEqual(self._turn("git reset --hard main", key=first_key), "allow-once")
+        self.assertEqual(len(first_cards), 1)
+
+        other_key = "agy-approval-other-session"
+        other_cards = self._listen(other_key, "deny")
+        self.assertEqual(self._turn("git reset --hard origin/main", key=other_key), "reject-once")
+        self.assertEqual(len(other_cards), 1)
+
+    def test_native_hardline_still_blocks_with_approval_prompts_off(self) -> None:
+        cards = self._listen("agy-approval-test", "once")
+        with patch.object(self.approval.approval_context, "_get_approval_mode", return_value="off"):
+            self.assertEqual(self._turn("rm -rf /"), "reject-once")
+        self.assertEqual(cards, [])
+        self.assertNotIn("permission.ask", [r["event"] for r in self.h.event_dicts()])
+
+    def test_flagged_command_without_a_surface_fails_closed(self) -> None:
+        self.assertEqual(self._turn("git reset --hard HEAD", platform=""), "reject-once")
+        self.assertNotIn("permission.ask", [r["event"] for r in self.h.event_dicts()])
+
+    def test_smart_approval_uses_the_hermes_guardian(self) -> None:
+        cards = self._listen("agy-approval-test", "deny")
+        with (patch.object(self.approval.approval_context, "_get_approval_mode", return_value="smart"),
+              patch.object(self.approval, "_smart_verdict", return_value="approve") as guardian):
+            self.assertEqual(self._turn("git reset --hard HEAD"), "allow-once")
+            guardian.assert_called_once()
+        self.assertEqual(cards, [])
+
+    def test_native_approval_never_selects_a_remote_always_option(self) -> None:
+        from agy_acp.permissions import check_native_command
+
+        broker = PermissionBroker(permission_dir=self.h.root / "test-permissions", command_guard=check_native_command)
+        request = {"id": 1, "params": {"toolCall": {"name": "run_command", "kind": "execute",
+                                                   "rawInput": {"CommandLine": "git status --short"}},
+                                     "options": [{"optionId": "always", "kind": "allow_always"},
+                                                 {"optionId": "once", "kind": "allow_once"}]}}
+        result = broker.handle(request, session_id="s")
+        self.assertEqual(result["result"]["outcome"]["optionId"], "once")
 
 
 class ReadonlyTests(HarnessTestCase):

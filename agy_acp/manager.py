@@ -20,6 +20,7 @@ import os
 import re
 import threading
 import time
+from contextvars import Context, copy_context
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
@@ -27,7 +28,7 @@ from typing import Any, Callable
 from . import fs, proctree
 from .display import EventLog, ToolCounter, summarize_update
 from .mcp_mount import mount as mount_bridge
-from .permissions import PermissionBroker
+from .permissions import PermissionBroker, check_native_command
 from .protocol import AgyConnection, AcpError
 from .prompt import TurnPrompt
 from .settings import Settings
@@ -143,6 +144,7 @@ class TurnState:
     hermes_session_id: str
     acp_session_id: str
     counter: ToolCounter
+    approval_context: Context = field(default_factory=copy_context, repr=False)
     started_at: float = field(default_factory=time.monotonic)
     text: list[str] = field(default_factory=list)
     reasoning: list[str] = field(default_factory=list)
@@ -276,7 +278,10 @@ class AgyAcpSessionManager:
             params: dict[str, Any] = {"sessionId": pooled.acp_session_id, "prompt": prompt.blocks}
             self._log_event(pooled, {"event": "turn.start", "turn": pooled.turn_seq,
                                      "chars": len(prompt.text), "blocks": len(prompt.blocks),
-                                     "notes": prompt.notes})
+                                     "notes": prompt.notes,
+                                     "tool_loop_limit": settings.tool_loop_limit,
+                                     "tool_loop_seconds": settings.tool_loop_seconds,
+                                     "prompt_timeout_seconds": budget})
             for note in prompt.notes:
                 if note not in turn.notes:
                     turn.notes.append(note)
@@ -312,6 +317,7 @@ class AgyAcpSessionManager:
             self._log_event(pooled, {"event": "turn.end", "turn": pooled.turn_seq,
                                      "stop": turn.stop_reason, "cancelled": turn.cancelled,
                                      "tools": turn.counter.count,
+                                     "approval_wait_seconds": round(turn.counter.approval_wait_seconds, 2),
                                      "elapsed": round(time.monotonic() - started, 2)})
             self.gate.release()
 
@@ -468,6 +474,7 @@ class AgyAcpSessionManager:
                           "child_home": settings.child_home, "proxy": bool(settings.proxy),
                           "bin": settings.command, "home": str(settings.home),
                           "capability_mode": settings.capability_mode})
+        native_gate = self._native_gate()
         broker = PermissionBroker(
             permission_dir=Path(settings.permission_dir),
             timeout=settings.permission_timeout,
@@ -478,7 +485,8 @@ class AgyAcpSessionManager:
             capability_mode=settings.capability_mode,
             write_timeout=min(settings.approval_wait or settings.permission_timeout,
                               settings.turn_timeout),
-            native_gate=self._native_gate(self._capture_session_key()),
+            native_gate=native_gate,
+            command_guard=check_native_command if native_gate is not None else None,
             on_wait_start=self.gate.pause,
             on_wait_end=self._resume_gate,
             log=events.write,
@@ -614,10 +622,17 @@ class AgyAcpSessionManager:
         params = message.get("params") or {}
         pooled = self._find_by_acp_id(holder, str(params.get("sessionId") or ""))
         if method == "session/request_permission":
-            if pooled is None:
+            turn = pooled.active_turn if pooled is not None else None
+            if turn is None:
                 return {"jsonrpc": "2.0", "id": message.get("id"),
                         "result": {"outcome": {"outcome": "cancelled"}}}
-            return pooled.broker.handle(message, session_id=pooled.hermes_session_id)
+            # The ACP reader is separate from the Hermes turn that owns approval routing.
+            started = time.monotonic()
+            try:
+                return turn.approval_context.run(pooled.broker.handle, message,
+                                                 session_id=pooled.hermes_session_id)
+            finally:
+                turn.counter.approval_wait_seconds += time.monotonic() - started
         handler = fs.HANDLERS.get(method)
         if handler is not None and pooled is not None:
             try:
@@ -672,17 +687,7 @@ class AgyAcpSessionManager:
         pooled.log({"event": "session.resync", "reason": reason, "acp_session": session_id})
 
     @staticmethod
-    def _capture_session_key() -> str:
-        """The key Hermes' approval gate files answers under, read where the agent context exists."""
-        try:
-            from tools.approval_context import get_current_session_key
-
-            return str(get_current_session_key("") or "")
-        except Exception:  # noqa: BLE001 - standalone runs have no Hermes context
-            return os.environ.get("HERMES_SESSION_KEY", "")
-
-    @staticmethod
-    def _native_gate(session_key: str):
+    def _native_gate():
         """Hermes' own approval gate, or ``None`` when this install cannot offer one.
 
         ``tools.approval.request_tool_approval`` is the documented entry for plugins: it asks the same
@@ -695,24 +700,14 @@ class AgyAcpSessionManager:
             return None
         try:
             from tools.approval import request_tool_approval
-            from tools.approval_context import reset_current_session_key, set_current_session_key
         except Exception:  # noqa: BLE001 - standalone use has no Hermes core on sys.path
             if mode == "hermes":
                 logger.warning("agy_acp: AGY_ACP_APPROVAL_BACKEND=hermes but tools.approval is not "
                                "importable; falling back to the file inbox")
             return None
 
-        key = session_key or os.environ.get("HERMES_SESSION_KEY", "")
-
         def gate(tool_display: str, reason: str, rule_key: str) -> dict[str, Any]:
-            token = None
-            try:
-                if key:
-                    token = set_current_session_key(key)
-                return request_tool_approval(tool_display, reason, rule_key=rule_key)
-            finally:
-                if token is not None:
-                    reset_current_session_key(token)
+            return request_tool_approval(tool_display, reason, rule_key=rule_key)
         return gate
 
     def _log_event(self, pooled: PooledSession, event: dict[str, Any]) -> None:

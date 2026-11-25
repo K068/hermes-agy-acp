@@ -45,6 +45,7 @@ class ToolCounter:
     started_at: float = field(default_factory=time.monotonic)
     count: int = 0
     tripped_reason: str = ""
+    approval_wait_seconds: float = 0.0
 
     def observe(self, *, is_start: bool) -> None:
         if is_start:
@@ -54,9 +55,9 @@ class ToolCounter:
         if self.count > self.limit:
             self.tripped_reason = f"tool loop: {self.count} tool calls in one turn (limit {self.limit})"
             return
-        elapsed = time.monotonic() - self.started_at
+        elapsed = time.monotonic() - self.started_at - self.approval_wait_seconds
         if elapsed > self.seconds:
-            self.tripped_reason = f"tool loop: turn has run {elapsed:.0f}s (limit {self.seconds:.0f}s)"
+            self.tripped_reason = f"tool loop: turn has run {elapsed:.0f}s outside approval waits (limit {self.seconds:.0f}s)"
 
     @property
     def tripped(self) -> bool:

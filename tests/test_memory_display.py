@@ -5,8 +5,11 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
-from agy_acp.display import EventLog, truncate
+from agy_acp.display import EventLog, ToolCounter, truncate
+from agy_acp.manager import AgyAcpSessionManager, TurnState
 from agy_acp.memory import (adapt_user_text, dedupe_and_render, estimate_tokens, parse_memory_block,
                             split_memory_block)
 from agy_acp.permissions import answer_from_cli
@@ -117,6 +120,32 @@ class ToolLoopTests(HarnessTestCase):
         self.assertLess(self.h.prompts()[0]["chars"], 100)
         loop_events = [e for e in self.h.event_dicts() if e.get("event") == "turn.loop_breaker"]
         self.assertEqual(len(loop_events), 1)
+
+
+class ApprovalTimeBudgetTests(unittest.TestCase):
+    def test_permission_wait_does_not_use_tool_time_budget(self) -> None:
+        counter = ToolCounter(limit=3, seconds=180, started_at=0)
+        turn = TurnState("chat", "native", counter)
+        now = 45.0
+
+        def approve(message, *, session_id):
+            nonlocal now
+            now += 140.0
+            return {"id": message["id"], "result": {"outcome": "selected"}}
+
+        pooled = SimpleNamespace(active_turn=turn, hermes_session_id="chat",
+                                 broker=SimpleNamespace(handle=approve))
+        manager = object.__new__(AgyAcpSessionManager)
+        message = {"id": 1, "method": "session/request_permission", "params": {"sessionId": "native"}}
+        with (patch.object(manager, "_find_by_acp_id", return_value=pooled),
+              patch("time.monotonic", side_effect=lambda: now)):
+            manager._route_request(message, {})
+            turn.feed({"sessionUpdate": "tool_call"})
+            self.assertFalse(counter.tripped)
+            now = 321.0
+            turn.feed({"sessionUpdate": "tool_call_update"})
+            self.assertTrue(counter.tripped)
+            self.assertIn("181s", counter.tripped_reason)
 
 
 class RealRecallShapeTests(unittest.TestCase):

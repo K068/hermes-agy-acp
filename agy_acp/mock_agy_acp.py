@@ -259,10 +259,11 @@ def _emit_prompt(session_id: str, prompt: list, request_id: int) -> None:
 
     if SCENARIO.startswith("permission") and (SCENARIO != "permission" or "permission" in text.lower()):
         readonly = SCENARIO == "permission_read"
+        command = text if SCENARIO == "permission_native" else "rm -rf build"
         tool = {"toolCallId": "call-1", "name": "read_file" if readonly else "run_command",
                 "kind": "read" if readonly else "execute",
-                "title": "read config.yaml" if readonly else "rm -rf build",
-                "rawInput": {"path": "config.yaml"} if readonly else {"command": "rm -rf build"}}
+                "title": "read config.yaml" if readonly else "run command",
+                "rawInput": {"path": "config.yaml"} if readonly else {"CommandLine": command}}
         notify("session/update", {"sessionId": session_id, "update": {
             "sessionUpdate": "tool_call", "toolCallId": "call-1", "kind": "execute",
             "title": tool["title"], "rawInput": tool["rawInput"], "status": "pending"}})
