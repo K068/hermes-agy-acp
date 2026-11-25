@@ -148,6 +148,20 @@ python -m agy_acp.cli permissions     # pending approval requests (file channel)
 python -m agy_acp.cli answer <id> allow
 ```
 
+### Verified on a real machine
+
+Measured against `agy 1.5.15` with a Google AI Pro account, not simulated:
+
+| What | Number |
+|---|---|
+| Prefix cache on a warm second turn | **8 458 cached / 2 528 new** input tokens → 77 % |
+| Same follow-up without a cache (cold first turn) | 10 515 input tokens |
+| Native context survived the delta | the model answered a fact from turn 1 with no history sent |
+| Delegated child (`delegate_task` on this provider) | `HARDOK` in 22.4 s, `api_calls=1` |
+| Windows process-tree teardown | child + grandchild stopped, 3.19 s, `is_alive() == false` |
+| Crash recovery | `kill -9` on the child, a new process resumed the same `session/load` |
+| A real turn captured into scope-recall | 4 `source_events`, searchable, tagged with the entry |
+
 ### Compatibility
 
 Measured against `agy 1.5.15` (ACP over stdio):
@@ -308,6 +322,20 @@ python -m agy_acp.cli cancel <chat>   # 停掉正在跑的那一轮
 python -m agy_acp.cli permissions     # 文件通道里待批的请求
 python -m agy_acp.cli answer <id> allow
 ```
+
+### 真机实测
+
+以下数字来自 `agy 1.5.15` + Google AI Pro 账号，不是模拟：
+
+| 项目 | 数字 |
+|---|---|
+| 温轮前缀缓存 | **命中 8 458 / 新增 2 528** 输入 token → 77% |
+| 无缓存的冷首轮 | 10 515 输入 token |
+| 原生上下文确实保留 | 没发历史，模型答出了第 1 轮里的事实 |
+| 子 agent（`delegate_task` 走本 provider） | 22.4 秒回 `HARDOK`，`api_calls=1` |
+| Windows 进程树清理 | 子进程 + 孙进程都被停掉，3.19 秒，`is_alive() == false` |
+| 崩溃恢复 | 子进程 `kill -9` 后，新进程用 `session/load` 接回同一会话 |
+| 真实一轮被写进 scope-recall | 4 条 `source_events`，可检索，带 entry 归属 |
 
 ### 兼容性
 
